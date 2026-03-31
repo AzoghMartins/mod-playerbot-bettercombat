@@ -3,7 +3,7 @@
 #
 
 #    PlayerbotBetterCombat.Enable
-#        Description: Reserved toggle for future combat-controller features.
+#        Description: Enables the `pull` combat-controller command for player-controlled bots.
 #        Default:     1 - Enabled
 #
 PlayerbotBetterCombat.Enable = 1
