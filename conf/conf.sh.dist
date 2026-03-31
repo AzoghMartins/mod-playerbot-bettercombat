@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+
+## Reserved for db_assembler integration when this module starts shipping SQL.
+## Keep this file even when empty so the module follows the normal AzerothCore layout.

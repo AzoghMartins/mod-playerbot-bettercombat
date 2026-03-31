@@ -1,0 +1,9 @@
+#
+# mod-playerbot-bettercombat
+#
+
+#    PlayerbotBetterCombat.Enable
+#        Description: Reserved toggle for future combat-controller features.
+#        Default:     1 - Enabled
+#
+PlayerbotBetterCombat.Enable = 1
