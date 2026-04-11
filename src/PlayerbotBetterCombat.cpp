@@ -1110,6 +1110,7 @@ struct BotHoldState
     float ccMinRange = 0.0f;
     float ccMaxRange = 0.0f;
     bool savedPositions = false;
+    bool hadNonCombatFollow = false;
     bool ccCastDone = false;
     bool ccReturning = false;
     PositionInfo previousStayPosition;
@@ -1728,6 +1729,20 @@ private:
         positions["return"] = state.previousReturnPosition;
     }
 
+    void RestoreFollowShortcutState(PlayerbotAI* botAI)
+    {
+        if (!botAI)
+            return;
+
+        botAI->ChangeStrategy("+follow,-passive,-grind,-move from group", BOT_STATE_NON_COMBAT);
+        botAI->ChangeStrategy("-stay,-follow,-passive,-grind,-move from group", BOT_STATE_COMBAT);
+        botAI->GetAiObjectContext()->GetValue<GuidVector>("prioritized targets")->Reset();
+
+        PositionMap& positions = GetPositionMap(botAI);
+        positions["return"].Reset();
+        positions["stay"].Reset();
+    }
+
     bool ResolveSupportCcSpell(Player* bot, Unit* target, uint32& spellId, float& minRange, float& maxRange) const
     {
         spellId = 0;
@@ -1857,6 +1872,9 @@ private:
 
             if (state.ccCastDone)
             {
+                if (bot->HasUnitState(UNIT_STATE_CASTING) || bot->IsNonMeleeSpellCast(false, false, true, false, false))
+                    continue;
+
                 state.ccReturning = true;
                 PullMovementController movement(botAI);
                 movement.FollowUnit(master, sPlayerbotAIConfig.followDistance);
@@ -1866,6 +1884,18 @@ private:
             SpellCastResult const castCheck = CheckBotSpellCast(bot, state.ccSpellId, ccTarget);
             if (!allowCast)
             {
+                if (state.addedNonCombatStay)
+                {
+                    if (castCheck == SPELL_FAILED_OUT_OF_RANGE ||
+                        castCheck == SPELL_FAILED_LINE_OF_SIGHT ||
+                        NeedsFacingAdjustment(castCheck) ||
+                        castCheck == SPELL_FAILED_MOVING)
+                    {
+                        botAI->ChangeStrategy("-stay", BOT_STATE_NON_COMBAT);
+                        state.addedNonCombatStay = false;
+                    }
+                }
+
                 if (NeedsFacingAdjustment(castCheck))
                 {
                     if (bot->isMoving())
@@ -1891,8 +1921,19 @@ private:
                 {
                     bot->StopMoving();
                 }
+                else
+                {
+                    SetHoldPosition(state, botAI, bot->GetPositionX(), bot->GetPositionY(), bot->GetPositionZ());
+                    EnsureStrategy(botAI, state.addedNonCombatStay, BOT_STATE_NON_COMBAT, "stay");
+                }
 
                 continue;
+            }
+
+            if (state.addedNonCombatStay)
+            {
+                botAI->ChangeStrategy("-stay", BOT_STATE_NON_COMBAT);
+                state.addedNonCombatStay = false;
             }
 
             if (ShouldRetrySpellCastLater(castCheck))
@@ -1946,6 +1987,48 @@ private:
         }
     }
 
+    bool IsSupportCrowdControlReady(BotHoldState& state, Player* owner)
+    {
+        if (state.isTank || !state.ccSpellId || state.ccTargetGuid.IsEmpty() || state.ccCastDone)
+            return true;
+
+        Player* bot = ObjectAccessor::FindPlayer(state.guid);
+        if (!IsLiveBot(bot))
+            return true;
+
+        PlayerbotAI* botAI = GET_PLAYERBOT_AI(bot);
+        if (!botAI || botAI->GetMaster() != owner)
+            return true;
+
+        Unit* ccTarget = botAI->GetUnit(state.ccTargetGuid);
+        if (!IsValidPullTarget(owner, ccTarget))
+            return true;
+
+        SetBotTargetContext(bot, ccTarget);
+
+        SpellCastResult const castCheck = CheckBotSpellCast(bot, state.ccSpellId, ccTarget);
+        if (castCheck == SPELL_FAILED_OUT_OF_RANGE ||
+            castCheck == SPELL_FAILED_LINE_OF_SIGHT ||
+            NeedsFacingAdjustment(castCheck) ||
+            castCheck == SPELL_FAILED_MOVING)
+        {
+            return false;
+        }
+
+        return true;
+    }
+
+    bool AreSupportCrowdControlsReady(PullSession& session, Player* owner)
+    {
+        for (BotHoldState& state : session.botStates)
+        {
+            if (!IsSupportCrowdControlReady(state, owner))
+                return false;
+        }
+
+        return true;
+    }
+
     void StartSession(Player* owner, std::vector<Player*> const& controlledBots)
     {
         Unit* target = ObjectAccessor::GetUnit(*owner, owner->GetTarget());
@@ -1987,6 +2070,10 @@ private:
             BotHoldState state;
             state.guid = bot->GetGUID();
             state.isTank = bot->GetGUID() == tank->GetGUID();
+
+            if (PlayerbotAI* botAI = GET_PLAYERBOT_AI(bot))
+                state.hadNonCombatFollow = botAI->HasStrategy("follow", BOT_STATE_NON_COMBAT);
+
             session.botStates.push_back(state);
         }
 
@@ -2076,7 +2163,15 @@ private:
 
         if (getMSTimeDiff(session.startedAtMs, getMSTime()) > PULL_ACQUIRE_TIMEOUT_MS)
         {
-            SendSystemMessage(owner, "pull cancelled because the tank could not reach shoot range.");
+            if (IsWithinPullWindow(tank, target, session.opener.minRange, session.opener.maxRange) &&
+                !AreSupportCrowdControlsReady(session, owner))
+            {
+                SendSystemMessage(owner, "pull cancelled because support cc bots could not reach cast range.");
+            }
+            else
+            {
+                SendSystemMessage(owner, "pull cancelled because the tank could not reach shoot range.");
+            }
             RestoreBotStates(session);
             return false;
         }
@@ -2110,6 +2205,12 @@ private:
                 return true;
             }
 
+            if (!AreSupportCrowdControlsReady(session, owner))
+            {
+                HoldTankDuringApproach(session, tank, target, tank->GetPositionX(), tank->GetPositionY(), tank->GetPositionZ());
+                return true;
+            }
+
             session.stage = PullStage::FirePullShot;
             return ProcessShotStage(session, owner, tank, tankAI, target);
         }
@@ -2134,6 +2235,12 @@ private:
             SendSystemMessage(owner, "pull cancelled because the tank has no firing spell.");
             RestoreBotStates(session);
             return false;
+        }
+
+        if (!AreSupportCrowdControlsReady(session, owner))
+        {
+            session.stage = PullStage::MoveTankToPullRange;
+            return true;
         }
 
         if (HasPullAlreadyCollapsedIntoMelee(tank, target))
@@ -2208,6 +2315,7 @@ private:
         }
 
         session.pullShotAtMs = getMSTime();
+        ManageSupportCrowdControl(session, owner, true);
         session.waitStagePrepared = false;
         session.stage = PullStage::WaitForMobArrival;
         return true;
@@ -2279,6 +2387,10 @@ private:
             bot->SetTarget(ObjectGuid::Empty);
             ResetBotMovementState(botAI);
             botAI->ChangeEngine(BOT_STATE_NON_COMBAT);
+
+            if (!state.isTank || state.hadNonCombatFollow)
+                RestoreFollowShortcutState(botAI);
+
             botAI->DoNextAction();
         }
 
@@ -2420,6 +2532,9 @@ private:
             RemoveStrategy(botAI, state.addedNonCombatPassive, BOT_STATE_NON_COMBAT, "passive");
             RemoveStrategy(botAI, state.addedNonCombatStay, BOT_STATE_NON_COMBAT, "stay");
             RestorePositions(state, botAI);
+
+            if (state.hadNonCombatFollow && !botAI->HasStrategy("follow", BOT_STATE_NON_COMBAT))
+                botAI->ChangeStrategy("+follow", BOT_STATE_NON_COMBAT);
 
             if (state.isTank && session.addedTankPullStrategy)
                 botAI->ChangeStrategy("-pull", BOT_STATE_COMBAT);

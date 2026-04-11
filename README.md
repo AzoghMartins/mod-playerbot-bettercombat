@@ -27,7 +27,8 @@ This repo is intentionally starting as a minimal scaffold so the module can be v
   paladin: `avenger's shield`, then `hand of reckoning`, then `exorcism`
   death knight: `death grip`, then `icy touch`
 - moves that tank into the chosen opener's real spell window and stops slightly inside max range
-- fires the selected opener
+- waits there until any pull-time CC bots are in position for their own spells
+- then fires the selected opener and lets prepared CC bots cast immediately
 - holds the tank in place until the target reaches melee
 - holds the rest of the player's controlled bots in a temporary passive state during that wait window
 - marks the pull target with skull when it reaches the tank in melee
