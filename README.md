@@ -12,7 +12,7 @@ This repo is intentionally starting as a minimal scaffold so the module can be v
 
 - standalone module repository under `AzerothDev/modules`
 - AzerothCore-compatible script loader scaffold
-- gameplay commands: `pull`, `sap`, `automark`
+- gameplay commands: `pull`, `tank`, `sap`, `automark`
 
 ## Current Functionality
 
@@ -29,6 +29,7 @@ This repo is intentionally starting as a minimal scaffold so the module can be v
 - moves that tank into the chosen opener's real spell window and stops slightly inside max range
 - waits there until any pull-time CC bots are in position for their own spells
 - then fires the selected opener and lets prepared CC bots cast immediately
+- if a `tank` marker exists, the tank first moves to the closest shootable line-of-sight point near that saved tank position, fires, then runs back to the saved tank position before holding the pack
 - holds the tank in place until the target reaches melee
 - holds the rest of the player's controlled bots in a temporary passive state during that wait window
 - marks the pull target with skull when it reaches the tank in melee
@@ -37,6 +38,14 @@ This repo is intentionally starting as a minimal scaffold so the module can be v
 - clears skull when that skull target dies
 - keeps one X assignment on another active unmarked combat target when possible, and promotes X to skull when the current skull target dies
 - releases the group back into normal combat once the target reaches the tank in melee
+- clears the saved `tank` marker after that pull combat finishes
+
+`tank`
+
+- arms a saved tank-position marker for the commanding player
+- teaches `Aedm` if the player does not already know it
+- the next `Aedm` ground-target cast stores the tank pull position for a later `pull`
+- `tank clear` removes the saved tank pull position
 
 `automark`
 

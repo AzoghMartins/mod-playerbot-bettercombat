@@ -14,8 +14,10 @@
 #include "Player.h"
 #include "PlayerScript.h"
 #include "PositionValue.h"
+#include "RtiTargetValue.h"
 #include "ScriptMgr.h"
 #include "ServerFacade.h"
+#include "Spell.h"
 #include "SpellInfo.h"
 #include "SpellMgr.h"
 #include "WorldScript.h"
@@ -24,8 +26,10 @@
 #include "MovementActions.h"
 #include "PlayerbotAI.h"
 #include "Playerbots.h"
+#include "TravelMgr.h"
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <cstdint>
 #include <iomanip>
 #include <map>
@@ -44,6 +48,7 @@ constexpr uint32 SAP_UPDATE_INTERVAL_MS = 200;
 constexpr uint32 SAP_TIMEOUT_MS = 30000;
 constexpr uint32 SAP_STEALTH_SETTLE_MS = 500;
 constexpr uint32 SAP_AI_SUPPRESS_MS = 1000;
+constexpr int32 CONTROLLED_CC_REFRESH_MS = 4000;
 constexpr float SAP_MELEE_STANDOFF = 0.5f;
 constexpr int8 CROSS_RTI_INDEX = 6;
 constexpr int8 SKULL_RTI_INDEX = 7;
@@ -52,6 +57,12 @@ constexpr float PULL_MIN_RANGE_BUFFER = 1.0f;
 constexpr float SAP_DISTRACT_STANDOFF = 20.0f;
 constexpr float SAP_DISTRACT_BEHIND_DISTANCE = 2.5f;
 constexpr float SAP_RETURN_EXTRA_DISTANCE = 1.0f;
+constexpr uint32 GROUND_MARKER_SPELL_ID = 30758; // Aedm
+constexpr uint32 GROUND_MARKER_VISUAL_ENTRY = 15631;
+constexpr float TANK_MARKER_REACH_DISTANCE = 1.5f;
+constexpr float TANK_PULL_SEARCH_STEP = 1.0f;
+constexpr char const* TANK_MARKER_RTSC_NAME = "bettercombat_tank_marker";
+constexpr char const* OFFTANK_MARKER_RTSC_NAME = "bettercombat_offtank_marker";
 
 std::string ToLower(std::string value)
 {
@@ -202,6 +213,35 @@ bool IsValidPullTarget(Player* player, Unit* target)
     return player->IsValidAttackTarget(target);
 }
 
+Unit* ResolveBotAssignedRtiCcTarget(Player* owner, Player* bot)
+{
+    if (!owner || !IsLiveBot(bot))
+        return nullptr;
+
+    PlayerbotAI* botAI = GET_PLAYERBOT_AI(bot);
+    if (!botAI || botAI->GetMaster() != owner)
+        return nullptr;
+
+    if (Unit* valueTarget = botAI->GetAiObjectContext()->GetValue<Unit*>("rti cc target")->Get(); IsValidPullTarget(owner, valueTarget))
+        return valueTarget;
+
+    Group* group = owner->GetGroup();
+    if (!group)
+        return nullptr;
+
+    std::string const rtiName = botAI->GetAiObjectContext()->GetValue<std::string>("rti cc")->Get();
+    int32 const rtiIndex = RtiTargetValue::GetRtiIndex(rtiName);
+    if (rtiIndex < 0)
+        return nullptr;
+
+    ObjectGuid const guid = group->GetTargetIcon(static_cast<uint8>(rtiIndex));
+    if (guid.IsEmpty())
+        return nullptr;
+
+    Unit* iconTarget = botAI->GetUnit(guid);
+    return IsValidPullTarget(owner, iconTarget) ? iconTarget : nullptr;
+}
+
 bool TargetHasAuraNamed(Unit* target, std::string const& expectedName)
 {
     if (!target || expectedName.empty())
@@ -222,35 +262,71 @@ bool TargetHasAuraNamed(Unit* target, std::string const& expectedName)
     return false;
 }
 
-bool TargetHasProtectedCcAura(Unit* target)
+std::string NormalizeProtectedCcName(std::string const& spellName)
+{
+    std::string const normalized = NormalizeCommand(spellName);
+    if (normalized.rfind("polymorph", 0) == 0)
+        return "polymorph";
+
+    return normalized;
+}
+
+bool IsProtectedCcName(std::string const& spellName)
+{
+    std::string const normalized = NormalizeProtectedCcName(spellName);
+    return normalized == "sap" ||
+           normalized == "shackle undead" ||
+           normalized == "hibernate" ||
+           normalized == "entangling roots" ||
+           normalized == "cyclone" ||
+           normalized == "repentance" ||
+           normalized == "hex" ||
+           normalized == "banish" ||
+           normalized == "polymorph";
+}
+
+std::string ResolveProtectedCcFamily(uint32 spellId)
+{
+    SpellInfo const* spellInfo = sSpellMgr->GetSpellInfo(spellId);
+    if (!spellInfo || !spellInfo->SpellName[0])
+        return std::string();
+
+    std::string const family = NormalizeProtectedCcName(spellInfo->SpellName[0]);
+    return IsProtectedCcName(family) ? family : std::string();
+}
+
+Aura* FindProtectedCcAura(Unit* target, ObjectGuid const* casterGuid = nullptr, std::string const* family = nullptr)
 {
     if (!target)
-        return false;
+        return nullptr;
 
     Unit::AuraApplicationMap const& auras = target->GetAppliedAuras();
     for (auto const& [spellId, auraApp] : auras)
     {
         Aura* aura = auraApp ? auraApp->GetBase() : nullptr;
         SpellInfo const* spellInfo = aura ? aura->GetSpellInfo() : nullptr;
-        if (!spellInfo || !spellInfo->SpellName[0])
+        if (!aura || !spellInfo || !spellInfo->SpellName[0])
             continue;
 
-        std::string const auraName = NormalizeCommand(spellInfo->SpellName[0]);
-        if (auraName == "sap" ||
-            auraName == "shackle undead" ||
-            auraName == "hibernate" ||
-            auraName == "entangling roots" ||
-            auraName == "cyclone" ||
-            auraName == "repentance" ||
-            auraName == "hex" ||
-            auraName == "banish" ||
-            auraName.rfind("polymorph", 0) == 0)
-        {
-            return true;
-        }
+        std::string const auraFamily = NormalizeProtectedCcName(spellInfo->SpellName[0]);
+        if (!IsProtectedCcName(auraFamily))
+            continue;
+
+        if (casterGuid && aura->GetCasterGUID() != *casterGuid)
+            continue;
+
+        if (family && auraFamily != *family)
+            continue;
+
+        return aura;
     }
 
-    return false;
+    return nullptr;
+}
+
+bool TargetHasProtectedCcAura(Unit* target)
+{
+    return FindProtectedCcAura(target) != nullptr;
 }
 
 bool IsTankProtectedCcTarget(Group* group, Unit* target)
@@ -311,6 +387,87 @@ Player* FindControlledMainTank(Player* owner, std::vector<Player*> const& bots)
             continue;
 
         if (PlayerbotAI::IsMainTank(bot))
+            return bot;
+    }
+
+    return nullptr;
+}
+
+bool IsGroupMainAssist(Player* player)
+{
+    if (!player)
+        return false;
+
+    Group* group = player->GetGroup();
+    if (!group)
+        return false;
+
+    Group::MemberSlotList const& slots = group->GetMemberSlots();
+    for (Group::member_citerator itr = slots.begin(); itr != slots.end(); ++itr)
+    {
+        if (itr->guid == player->GetGUID())
+            return (itr->flags & MEMBER_FLAG_MAINASSIST) != 0;
+    }
+
+    return false;
+}
+
+Player* FindControlledOffTank(Player* owner, std::vector<Player*> const& bots, Player* mainTank)
+{
+    if (!owner)
+        return nullptr;
+
+    for (Player* bot : bots)
+    {
+        if (!bot || !bot->IsAlive() || bot == mainTank)
+            continue;
+
+        if (!IsGroupMainAssist(bot) || !ResolveBotAssignedRtiCcTarget(owner, bot))
+            continue;
+
+        if (PlayerbotAI::IsAssistTank(bot) || PlayerbotAI::IsTank(bot) || PlayerbotAI::IsTank(bot, true))
+            return bot;
+    }
+
+    for (Player* bot : bots)
+    {
+        if (!bot || !bot->IsAlive() || bot == mainTank)
+            continue;
+
+        if (!ResolveBotAssignedRtiCcTarget(owner, bot))
+            continue;
+
+        if (PlayerbotAI::IsAssistTankOfIndex(bot, 0, true))
+            return bot;
+    }
+
+    for (Player* bot : bots)
+    {
+        if (!bot || !bot->IsAlive() || bot == mainTank)
+            continue;
+
+        if (!ResolveBotAssignedRtiCcTarget(owner, bot))
+            continue;
+
+        if (PlayerbotAI::IsAssistTank(bot) || PlayerbotAI::IsTank(bot) || PlayerbotAI::IsTank(bot, true))
+            return bot;
+    }
+
+    for (Player* bot : bots)
+    {
+        if (!bot || !bot->IsAlive() || bot == mainTank)
+            continue;
+
+        if (PlayerbotAI::IsAssistTankOfIndex(bot, 0, true))
+            return bot;
+    }
+
+    for (Player* bot : bots)
+    {
+        if (!bot || !bot->IsAlive() || bot == mainTank)
+            continue;
+
+        if (PlayerbotAI::IsAssistTank(bot))
             return bot;
     }
 
@@ -945,10 +1102,44 @@ bool HasPullAlreadyCollapsedIntoMelee(Player* tank, Unit* target)
     if (!tank || !target)
         return false;
 
+    float const engagementDistance = tank->GetCombatReach() + target->GetCombatReach() + 1.0f;
     return tank->IsWithinMeleeRange(target) ||
            target->IsWithinMeleeRange(tank) ||
-           tank->GetVictim() == target ||
-           target->GetVictim() == tank;
+           ((tank->GetVictim() == target || target->GetVictim() == tank) &&
+            tank->IsWithinCombatRange(target, engagementDistance));
+}
+
+uint32 ResolvePullShotSettleDelay(Player* tank, PullOpener const& opener)
+{
+    if (!tank || !opener.IsValid() || opener.spellIds.empty())
+        return 0;
+
+    uint32 settleDelay = 0;
+    if (SpellInfo const* spellInfo = sSpellMgr->GetSpellInfo(opener.spellIds.front()))
+        settleDelay = spellInfo->CalcCastTime(tank);
+
+    if (opener.usesEquippedRangedSpell)
+    {
+        uint32 const rangedAttackDelay = std::clamp<uint32>(tank->GetAttackTime(RANGED_ATTACK) + 250, 750, 4000);
+        settleDelay = std::max(settleDelay, rangedAttackDelay);
+    }
+    else if (settleDelay > 0)
+    {
+        settleDelay += 100;
+    }
+
+    return settleDelay;
+}
+
+bool IsPullShotStillResolving(Player* tank)
+{
+    if (!tank)
+        return false;
+
+    if (tank->HasUnitState(UNIT_STATE_CASTING))
+        return true;
+
+    return tank->IsNonMeleeSpellCast(false, false, true, false, false);
 }
 
 void StopPetCombat(Player* bot)
@@ -982,6 +1173,35 @@ void StopBotCombat(Player* bot, bool dropTarget)
 
     if (dropTarget)
         botAI->DoSpecificAction("drop target", Event(), true);
+
+    bot->InterruptNonMeleeSpells(false);
+
+    if (bot->GetCurrentSpell(CURRENT_AUTOREPEAT_SPELL))
+        bot->InterruptSpell(CURRENT_AUTOREPEAT_SPELL);
+
+    bot->AttackStop();
+
+    if (bot->isMoving())
+        bot->StopMoving();
+
+    bot->ClearUnitState(UNIT_STATE_CHASE);
+    bot->ClearUnitState(UNIT_STATE_FOLLOW);
+    StopPetCombat(bot);
+}
+
+void ClearBotCombatStateForRetreat(Player* bot)
+{
+    if (!IsLiveBot(bot))
+        return;
+
+    PlayerbotAI* botAI = GET_PLAYERBOT_AI(bot);
+    if (!botAI)
+        return;
+
+    botAI->GetAiObjectContext()->GetValue<Unit*>("old target")->Set(nullptr);
+    botAI->GetAiObjectContext()->GetValue<Unit*>("current target")->Set(nullptr);
+    botAI->GetAiObjectContext()->GetValue<ObjectGuid>("pull target")->Set(ObjectGuid::Empty);
+    botAI->GetAiObjectContext()->GetValue<GuidVector>("prioritized targets")->Reset();
 
     bot->InterruptNonMeleeSpells(false);
 
@@ -1117,10 +1337,34 @@ struct BotHoldState
     PositionInfo previousReturnPosition;
 };
 
+struct StoredWorldPoint
+{
+    uint32 mapId = MAPID_INVALID;
+    float x = 0.0f;
+    float y = 0.0f;
+    float z = 0.0f;
+
+    bool IsValid() const
+    {
+        return mapId != MAPID_INVALID;
+    }
+};
+
+struct TankMarkerState
+{
+    bool awaitingPlacement = false;
+    ObjectGuid sourceBotGuid = ObjectGuid::Empty;
+    StoredWorldPoint position;
+};
+
 enum class PullStage
 {
     MoveTankToPullRange,
     FirePullShot,
+    WaitForPullShotResolve,
+    FireFollowupPulls,
+    WaitForFollowupResolve,
+    ReturnTankToHoldPoint,
     WaitForMobArrival,
     WaitForCombatEnd
 };
@@ -1130,14 +1374,28 @@ struct PullSession
     ObjectGuid ownerGuid = ObjectGuid::Empty;
     ObjectGuid tankGuid = ObjectGuid::Empty;
     ObjectGuid targetGuid = ObjectGuid::Empty;
+    ObjectGuid offTankGuid = ObjectGuid::Empty;
+    ObjectGuid offTankTargetGuid = ObjectGuid::Empty;
     PullOpener opener;
+    PullOpener offTankOpener;
     PullStage stage = PullStage::MoveTankToPullRange;
     uint32 startedAtMs = 0;
     uint32 pullShotAtMs = 0;
+    uint32 offTankPullShotAtMs = 0;
     bool tankPullArmed = false;
     bool addedTankPullStrategy = false;
     bool moveStagePrepared = false;
+    bool returnStagePrepared = false;
     bool waitStagePrepared = false;
+    bool usesTankMarker = false;
+    bool offTankMoveStagePrepared = false;
+    bool offTankReturnStagePrepared = false;
+    bool offTankWaitStagePrepared = false;
+    bool usesOffTankMarker = false;
+    bool mainTankCombatReleased = false;
+    bool offTankCombatReleased = false;
+    StoredWorldPoint tankMarkerPosition;
+    StoredWorldPoint offTankMarkerPosition;
     std::vector<BotHoldState> botStates;
 };
 
@@ -1178,6 +1436,22 @@ BotHoldState* FindBotState(PullSession& session, ObjectGuid const& guid)
     }
 
     return nullptr;
+}
+
+bool HasOffTankAssignment(PullSession const& session)
+{
+    return !session.offTankGuid.IsEmpty() && !session.offTankTargetGuid.IsEmpty() && session.offTankOpener.IsValid();
+}
+
+bool HasPendingSupportCrowdControl(PullSession const& session)
+{
+    for (BotHoldState const& state : session.botStates)
+    {
+        if (!state.isTank && state.ccSpellId && !state.ccTargetGuid.IsEmpty() && !state.ccCastDone)
+            return true;
+    }
+
+    return false;
 }
 
 class PullMovementController final : public MovementAction
@@ -1246,6 +1520,105 @@ public:
         return true;
     }
 
+    bool TryHandleTankCommand(Player* owner, std::string const& msg)
+    {
+        if (!IsModuleEnabled() || !owner)
+            return false;
+
+        std::string const normalized = NormalizeCommand(msg);
+        if (normalized != "tank" && normalized != "tank clear")
+            return false;
+
+        if (normalized == "tank clear")
+        {
+            std::vector<Player*> const controlledBots = CollectControlledBots(owner);
+            if (Player* tank = FindControlledMainTank(owner, controlledBots))
+            {
+                if (PlayerbotAI* tankAI = GET_PLAYERBOT_AI(tank))
+                    tankAI->HandleCommand(CHAT_MSG_SAY, std::string("rtsc unsave ") + TANK_MARKER_RTSC_NAME, owner);
+            }
+
+            tankMarkers.erase(owner->GetGUID());
+            SendSystemMessage(owner, "tank pull position cleared.");
+            return true;
+        }
+
+        std::vector<Player*> const controlledBots = CollectControlledBots(owner);
+        Player* tank = FindControlledMainTank(owner, controlledBots);
+        if (!tank)
+        {
+            SendSystemMessage(owner, "tank requires a controlled main tank bot in your current group or raid.");
+            return true;
+        }
+
+        if (!EnsureGroundMarkerSpell(owner))
+        {
+            SendSystemMessage(owner, "tank marker could not enable Aedm.");
+            return true;
+        }
+
+        ArmMarkerPlacement(owner, tank, tankMarkers, TANK_MARKER_RTSC_NAME, "tank marker armed. Cast Aedm to place the tank pull position.");
+        return true;
+    }
+
+    bool TryHandleOffTankCommand(Player* owner, std::string const& msg)
+    {
+        if (!IsModuleEnabled() || !owner)
+            return false;
+
+        std::string const normalized = NormalizeCommand(msg);
+        if (normalized != "offtank" && normalized != "offtank clear")
+            return false;
+
+        std::vector<Player*> const controlledBots = CollectControlledBots(owner);
+        Player* mainTank = FindControlledMainTank(owner, controlledBots);
+        Player* offTank = FindControlledOffTank(owner, controlledBots, mainTank);
+
+        if (normalized == "offtank clear")
+        {
+            if (offTank)
+            {
+                if (PlayerbotAI* offTankAI = GET_PLAYERBOT_AI(offTank))
+                    offTankAI->HandleCommand(CHAT_MSG_SAY, std::string("rtsc unsave ") + OFFTANK_MARKER_RTSC_NAME, owner);
+            }
+
+            offTankMarkers.erase(owner->GetGUID());
+            SendSystemMessage(owner, "offtank pull position cleared.");
+            return true;
+        }
+
+        if (!offTank)
+        {
+            SendSystemMessage(owner, "offtank requires a controlled off-tank bot in your current group or raid.");
+            return true;
+        }
+
+        if (!EnsureGroundMarkerSpell(owner))
+        {
+            SendSystemMessage(owner, "offtank marker could not enable Aedm.");
+            return true;
+        }
+
+        ArmMarkerPlacement(owner, offTank, offTankMarkers, OFFTANK_MARKER_RTSC_NAME,
+                           "offtank marker armed. Cast Aedm to place the off-tank pull position.");
+        return true;
+    }
+
+    void HandlePlayerSpellCast(Player* owner, Spell* spell)
+    {
+        if (!IsModuleEnabled() || !owner || !spell || !spell->m_spellInfo || spell->m_spellInfo->Id != GROUND_MARKER_SPELL_ID)
+            return;
+
+        if (HandleMarkerSpellCast(owner, spell, tankMarkers, TANK_MARKER_RTSC_NAME, "tank pull position saved.",
+                                  "tank marker cancelled because no destination was selected."))
+        {
+            return;
+        }
+
+        HandleMarkerSpellCast(owner, spell, offTankMarkers, OFFTANK_MARKER_RTSC_NAME, "offtank pull position saved.",
+                              "offtank marker cancelled because no destination was selected.");
+    }
+
     bool TryHandleAutoMarkCommand(Player* owner, std::string const& msg)
     {
         if (!IsModuleEnabled() || !owner)
@@ -1290,6 +1663,7 @@ public:
 
         updateAccumulator = 0;
         UpdateCombatRaidIcons();
+        UpdateControlledCrowdControl();
 
         if (sessions.empty())
             return;
@@ -1305,6 +1679,218 @@ public:
 
 private:
     PullManager() = default;
+
+    Unit* ResolveSessionTarget(PlayerbotAI* botAI, ObjectGuid const& guid)
+    {
+        if (!botAI || guid.IsEmpty())
+            return nullptr;
+
+        return botAI->GetUnit(guid);
+    }
+
+    bool MoveTankIntoPullPosition(PullSession& session, Player* tank, PlayerbotAI* tankAI, Unit* target, PullOpener const& opener,
+                                  bool& prepared)
+    {
+        if (!tank || !tankAI || !target || !opener.IsValid())
+            return false;
+
+        if (!prepared)
+        {
+            PrepareTankForApproach(session, tank, target);
+            prepared = true;
+        }
+
+        float const desiredDistance = ResolveDesiredPullDistance(opener.minRange, opener.maxRange);
+        if (desiredDistance <= 0.0f)
+            return false;
+
+        float const distance = tank->GetDistance(target);
+        float const minimumDistance = std::max(0.0f, opener.minRange + 0.1f);
+        bool const withinPullDistance = distance <= opener.maxRange && distance >= minimumDistance;
+        if (withinPullDistance && !tank->IsWithinLOSInMap(target))
+        {
+            PullMovementController movement(tankAI);
+            movement.MoveToRangedLos(target);
+            return false;
+        }
+
+        if (IsWithinPullWindow(tank, target, opener.minRange, opener.maxRange))
+        {
+            if (tank->isMoving())
+                tank->StopMoving();
+
+            if (!IsFacingSpellTarget(tank, target))
+            {
+                FaceBotTowardsTarget(tank, target);
+                return false;
+            }
+
+            HoldTankBeforeShot(session, tank, target);
+            return true;
+        }
+
+        float pullX = 0.0f;
+        float pullY = 0.0f;
+        float pullZ = 0.0f;
+        target->GetNearPoint(tank, pullX, pullY, pullZ, 0.0f, desiredDistance, target->GetAngle(tank));
+        HoldTankDuringApproach(session, tank, target, pullX, pullY, pullZ);
+
+        PullMovementController movement(tankAI);
+        if (!movement.MoveToPoint(target->GetMapId(), pullX, pullY, pullZ))
+            movement.MoveIntoRange(target, desiredDistance);
+
+        return false;
+    }
+
+    bool HasTankReachedCombatTrigger(Player* tank, Unit* target)
+    {
+        if (!tank || !target)
+            return false;
+
+        return tank->IsWithinMeleeRange(target) ||
+               target->IsWithinMeleeRange(tank) ||
+               (target->GetVictim() == tank &&
+                tank->IsWithinCombatRange(target, tank->GetCombatReach() + target->GetCombatReach() + 1.0f));
+    }
+
+    void ClearOffTankAssignment(PullSession& session)
+    {
+        session.offTankGuid = ObjectGuid::Empty;
+        session.offTankTargetGuid = ObjectGuid::Empty;
+        session.offTankOpener = {};
+        session.offTankPullShotAtMs = 0;
+        session.offTankMoveStagePrepared = false;
+        session.offTankReturnStagePrepared = false;
+        session.offTankWaitStagePrepared = false;
+        session.offTankCombatReleased = false;
+    }
+
+    bool EnsureGroundMarkerSpell(Player* owner)
+    {
+        if (!owner)
+            return false;
+
+        if (owner->HasSpell(GROUND_MARKER_SPELL_ID))
+            return true;
+
+        std::vector<Player*> const controlledBots = CollectControlledBots(owner);
+        Player* tank = FindControlledMainTank(owner, controlledBots);
+        Player* sourceBot = tank ? tank : (!controlledBots.empty() ? controlledBots.front() : nullptr);
+        if (PlayerbotAI* botAI = sourceBot ? GET_PLAYERBOT_AI(sourceBot) : nullptr)
+            botAI->HandleCommand(CHAT_MSG_SAY, "rtsc", owner);
+
+        if (!owner->HasSpell(GROUND_MARKER_SPELL_ID))
+            owner->learnSpell(GROUND_MARKER_SPELL_ID, false);
+
+        return owner->HasSpell(GROUND_MARKER_SPELL_ID);
+    }
+
+    void ArmMarkerPlacement(Player* owner, Player* sourceBot, std::map<ObjectGuid, TankMarkerState>& markers,
+                            char const* rtscName, std::string const& armedMessage)
+    {
+        if (!owner || !sourceBot || !rtscName)
+            return;
+
+        TankMarkerState& markerState = markers[owner->GetGUID()];
+        markerState.awaitingPlacement = true;
+        markerState.sourceBotGuid = sourceBot->GetGUID();
+        markerState.position = StoredWorldPoint();
+
+        if (PlayerbotAI* sourceBotAI = GET_PLAYERBOT_AI(sourceBot))
+        {
+            sourceBotAI->HandleCommand(CHAT_MSG_SAY, std::string("rtsc unsave ") + rtscName, owner);
+            sourceBotAI->HandleCommand(CHAT_MSG_SAY, std::string("rtsc save ") + rtscName, owner);
+        }
+
+        SendSystemMessage(owner, armedMessage);
+    }
+
+    bool HandleMarkerSpellCast(Player* owner, Spell* spell, std::map<ObjectGuid, TankMarkerState>& markers, char const* rtscName,
+                               std::string const& savedMessage, std::string const& cancelledMessage)
+    {
+        if (!owner || !spell || !rtscName)
+            return false;
+
+        auto markerItr = markers.find(owner->GetGUID());
+        if (markerItr == markers.end() || !markerItr->second.awaitingPlacement)
+            return false;
+
+        markerItr->second.awaitingPlacement = false;
+        Player* sourceBot = ObjectAccessor::FindPlayer(markerItr->second.sourceBotGuid);
+        PlayerbotAI* sourceBotAI = sourceBot ? GET_PLAYERBOT_AI(sourceBot) : nullptr;
+        if (sourceBotAI)
+        {
+            WorldPosition const rtscPosition =
+                sourceBotAI->GetAiObjectContext()->GetValue<WorldPosition>("RTSC saved location", rtscName)->Get();
+            if (rtscPosition)
+            {
+                markerItr->second.position.mapId = rtscPosition.GetMapId();
+                markerItr->second.position.x = rtscPosition.GetPositionX();
+                markerItr->second.position.y = rtscPosition.GetPositionY();
+                markerItr->second.position.z = rtscPosition.GetPositionZ();
+                SendSystemMessage(owner, savedMessage);
+                return true;
+            }
+        }
+
+        if (!spell->m_targets.HasDst() || !spell->m_targets.GetDstPos())
+        {
+            SendSystemMessage(owner, cancelledMessage);
+            return true;
+        }
+
+        WorldLocation const* destination = spell->m_targets.GetDstPos();
+        markerItr->second.position.mapId = destination->GetMapId();
+        markerItr->second.position.x = destination->GetPositionX();
+        markerItr->second.position.y = destination->GetPositionY();
+        markerItr->second.position.z = destination->GetPositionZ();
+
+        SendSystemMessage(owner, savedMessage);
+        return true;
+    }
+
+    StoredWorldPoint const* GetStoredMarker(Player const* owner, Player const* sourceBot, std::map<ObjectGuid, TankMarkerState>& markers,
+                                            char const* rtscName)
+    {
+        if (!owner || !rtscName)
+            return nullptr;
+
+        auto const itr = markers.find(owner->GetGUID());
+        if (sourceBot)
+        {
+            PlayerbotAI* sourceBotAI = GET_PLAYERBOT_AI(const_cast<Player*>(sourceBot));
+            if (sourceBotAI)
+            {
+                WorldPosition const rtscPosition =
+                    sourceBotAI->GetAiObjectContext()->GetValue<WorldPosition>("RTSC saved location", rtscName)->Get();
+                if (rtscPosition)
+                {
+                    auto& markerState = markers[owner->GetGUID()];
+                    markerState.sourceBotGuid = sourceBot->GetGUID();
+                    markerState.position.mapId = rtscPosition.GetMapId();
+                    markerState.position.x = rtscPosition.GetPositionX();
+                    markerState.position.y = rtscPosition.GetPositionY();
+                    markerState.position.z = rtscPosition.GetPositionZ();
+                    return &markerState.position;
+                }
+            }
+        }
+
+        if (itr == tankMarkers.end() || !itr->second.position.IsValid())
+            return nullptr;
+
+        return &itr->second.position;
+    }
+
+    StoredWorldPoint const* GetStoredTankMarker(Player const* owner, Player const* tank)
+    {
+        return GetStoredMarker(owner, tank, tankMarkers, TANK_MARKER_RTSC_NAME);
+    }
+
+    StoredWorldPoint const* GetStoredOffTankMarker(Player const* owner, Player const* offTank)
+    {
+        return GetStoredMarker(owner, offTank, offTankMarkers, OFFTANK_MARKER_RTSC_NAME);
+    }
 
     bool IsAutoMarkEnabled(Player const* owner) const
     {
@@ -1640,6 +2226,121 @@ private:
         }
     }
 
+    void MaintainAssignedCrowdControl(Player* owner, Player* bot)
+    {
+        if (!owner || !IsLiveBot(bot) || PlayerbotAI::IsTank(bot) || PlayerbotAI::IsTank(bot, true))
+            return;
+
+        PlayerbotAI* botAI = GET_PLAYERBOT_AI(bot);
+        if (!botAI || botAI->GetMaster() != owner)
+            return;
+
+        Unit* ccTarget = ResolveBotAssignedRtiCcTarget(owner, bot);
+        if (!IsValidPullTarget(owner, ccTarget))
+            return;
+
+        Group* group = owner->GetGroup();
+        if (group && group->GetTargetIcon(SKULL_RTI_INDEX) == ccTarget->GetGUID())
+            return;
+
+        if (!owner->IsInCombat() && !bot->IsInCombat() && !ccTarget->IsInCombat())
+            return;
+
+        uint32 spellId = 0;
+        float minRange = 0.0f;
+        float maxRange = 0.0f;
+        if (!ResolveSupportCcSpell(bot, ccTarget, spellId, minRange, maxRange))
+            return;
+
+        std::string const family = ResolveProtectedCcFamily(spellId);
+        if (family.empty())
+            return;
+
+        ObjectGuid const casterGuid = bot->GetGUID();
+        Aura* ownedAura = FindProtectedCcAura(ccTarget, &casterGuid, &family);
+        if (ownedAura)
+        {
+            if (ownedAura->IsPermanent() || ownedAura->GetDuration() > CONTROLLED_CC_REFRESH_MS)
+                return;
+        }
+        else if (FindProtectedCcAura(ccTarget))
+        {
+            return;
+        }
+
+        SpellCastResult const castCheck = CheckBotSpellCast(bot, spellId, ccTarget);
+        if (ShouldRetrySpellCastLater(castCheck))
+            return;
+
+        if (NeedsFacingAdjustment(castCheck))
+        {
+            if (bot->isMoving())
+                bot->StopMoving();
+
+            FaceBotTowardsTarget(bot, ccTarget);
+            return;
+        }
+
+        if (castCheck == SPELL_FAILED_OUT_OF_RANGE)
+        {
+            PullMovementController movement(botAI);
+            float const desiredDistance = ResolveDesiredPullDistance(minRange, maxRange);
+            if (!ccTarget->IsWithinLOSInMap(bot))
+                movement.MoveToRangedLos(ccTarget);
+            else
+                movement.MoveIntoRange(ccTarget, desiredDistance);
+            return;
+        }
+
+        if (castCheck == SPELL_FAILED_LINE_OF_SIGHT)
+        {
+            PullMovementController movement(botAI);
+            movement.MoveToRangedLos(ccTarget);
+            return;
+        }
+
+        if (castCheck == SPELL_FAILED_MOVING)
+        {
+            if (bot->isMoving())
+                bot->StopMoving();
+            return;
+        }
+
+        if (!IsUsableSpellCastResult(castCheck))
+            return;
+
+        if (bot->isMoving())
+        {
+            bot->StopMoving();
+            return;
+        }
+
+        SetBotTargetContext(bot, ccTarget);
+        botAI->CastSpell(spellId, ccTarget);
+    }
+
+    void UpdateControlledCrowdControl()
+    {
+        std::shared_lock<std::shared_mutex> lock(*HashMapHolder<Player>::GetLock());
+
+        for (auto const& [ownerGuid, owner] : ObjectAccessor::GetPlayers())
+        {
+            if (!owner || !owner->IsInWorld() || owner->IsDuringRemoveFromWorld() || IsLiveBot(owner))
+                continue;
+
+            auto sessionIt = sessions.find(ownerGuid);
+            if (sessionIt != sessions.end() && sessionIt->second.stage != PullStage::WaitForCombatEnd)
+                continue;
+
+            std::vector<Player*> const controlledBots = CollectControlledBots(owner);
+            if (controlledBots.empty())
+                continue;
+
+            for (Player* bot : controlledBots)
+                MaintainAssignedCrowdControl(owner, bot);
+        }
+    }
+
     void EnforceTankCombatTarget(Player* owner, Player* tank, std::vector<Player*> const& controlledBots)
     {
         if (!owner || !IsLiveBot(tank))
@@ -1743,6 +2444,28 @@ private:
         positions["stay"].Reset();
     }
 
+    void CreateGroundMarkerVisual(Player* source, StoredWorldPoint const& point)
+    {
+        if (!source || !point.IsValid())
+            return;
+
+        if (Creature* marker = source->SummonCreature(GROUND_MARKER_VISUAL_ENTRY, point.x, point.y, point.z,
+                                                      source->GetOrientation(), TEMPSUMMON_TIMED_DESPAWN, 2000.0f))
+        {
+            marker->SetObjectScale(0.5f);
+        }
+    }
+
+    bool IsStoredPointValidForUnit(StoredWorldPoint const& point, WorldObject const* unit)
+    {
+        return unit && point.IsValid() && unit->GetMapId() == point.mapId;
+    }
+
+    bool HasReachedStoredWorldPoint(Player* bot, StoredWorldPoint const& point, float distance)
+    {
+        return bot && IsStoredPointValidForUnit(point, bot) && bot->GetDistance(point.x, point.y, point.z) <= distance;
+    }
+
     bool ResolveSupportCcSpell(Player* bot, Unit* target, uint32& spellId, float& minRange, float& maxRange) const
     {
         spellId = 0;
@@ -1804,7 +2527,8 @@ private:
         return false;
     }
 
-    void InitializeSupportCc(PullSession& session, Player* owner, std::vector<Player*> const& controlledBots, Unit* pullTarget)
+    void InitializeSupportCc(PullSession& session, Player* owner, std::vector<Player*> const& controlledBots, Unit* pullTarget,
+                             Unit* offTankTarget)
     {
         for (BotHoldState& state : session.botStates)
         {
@@ -1819,11 +2543,14 @@ private:
             if (!botAI || botAI->GetMaster() != owner)
                 continue;
 
-            Unit* ccTarget = botAI->GetAiObjectContext()->GetValue<Unit*>("rti cc target")->Get();
+            Unit* ccTarget = ResolveBotAssignedRtiCcTarget(owner, bot);
             if (!IsValidPullTarget(owner, ccTarget))
                 continue;
 
             if (pullTarget && ccTarget->GetGUID() == pullTarget->GetGUID())
+                continue;
+
+            if (offTankTarget && ccTarget->GetGUID() == offTankTarget->GetGUID())
                 continue;
 
             uint32 spellId = 0;
@@ -2064,12 +2791,53 @@ private:
         session.stage = PullStage::MoveTankToPullRange;
         session.startedAtMs = getMSTime();
 
+        if (StoredWorldPoint const* tankMarker = GetStoredTankMarker(owner, tank); tankMarker && tankMarker->mapId == owner->GetMapId())
+        {
+            session.usesTankMarker = true;
+            session.tankMarkerPosition = *tankMarker;
+        }
+
+        std::string offTankFallbackMessage;
+        if (Player* offTank = FindControlledOffTank(owner, controlledBots, tank))
+        {
+            Unit* offTankTarget = ResolveBotAssignedRtiCcTarget(owner, offTank);
+            bool const hasDistinctOffTankTarget =
+                IsValidPullTarget(owner, offTankTarget) && offTankTarget->GetGUID() != target->GetGUID();
+
+            if (hasDistinctOffTankTarget)
+            {
+                PullOpener const offTankOpener = ResolvePullOpener(offTank, offTankTarget);
+                StoredWorldPoint const* offTankMarker = GetStoredOffTankMarker(owner, offTank);
+
+                if (!offTankOpener.IsValid())
+                {
+                    offTankFallbackMessage = "off-tank assignment ignored because the off-tank has no usable pull opener.";
+                }
+                else
+                {
+                    session.offTankGuid = offTank->GetGUID();
+                    session.offTankTargetGuid = offTankTarget->GetGUID();
+                    session.offTankOpener = offTankOpener;
+
+                    if (offTankMarker && offTankMarker->mapId == owner->GetMapId())
+                    {
+                        session.usesOffTankMarker = true;
+                        session.offTankMarkerPosition = *offTankMarker;
+                    }
+                }
+            }
+            else
+            {
+                offTankFallbackMessage = "off-tank assignment ignored because the off-tank has no live rti cc target.";
+            }
+        }
+
         session.botStates.reserve(controlledBots.size());
         for (Player* bot : controlledBots)
         {
             BotHoldState state;
             state.guid = bot->GetGUID();
-            state.isTank = bot->GetGUID() == tank->GetGUID();
+            state.isTank = bot->GetGUID() == tank->GetGUID() || bot->GetGUID() == session.offTankGuid;
 
             if (PlayerbotAI* botAI = GET_PLAYERBOT_AI(bot))
                 state.hadNonCombatFollow = botAI->HasStrategy("follow", BOT_STATE_NON_COMBAT);
@@ -2077,9 +2845,19 @@ private:
             session.botStates.push_back(state);
         }
 
-        InitializeSupportCc(session, owner, controlledBots, target);
+        Unit* offTankTarget = nullptr;
+        if (HasOffTankAssignment(session))
+        {
+            if (PlayerbotAI* offTankAI = GET_PLAYERBOT_AI(ObjectAccessor::FindPlayer(session.offTankGuid)))
+                offTankTarget = offTankAI->GetUnit(session.offTankTargetGuid);
+        }
+
+        InitializeSupportCc(session, owner, controlledBots, target, offTankTarget);
 
         sessions[owner->GetGUID()] = session;
+        if (!offTankFallbackMessage.empty())
+            SendSystemMessage(owner, offTankFallbackMessage);
+
         SendSystemMessage(owner, "pull started on " + std::string(target->GetName()) + ".");
     }
 
@@ -2108,6 +2886,27 @@ private:
             return false;
         }
 
+        Player* offTank = nullptr;
+        PlayerbotAI* offTankAI = nullptr;
+        if (HasOffTankAssignment(session))
+        {
+            offTank = ObjectAccessor::FindPlayer(session.offTankGuid);
+            if (!IsLiveBot(offTank))
+            {
+                SendSystemMessage(owner, "pull cancelled because the off-tank bot is no longer available.");
+                RestoreBotStates(session);
+                return false;
+            }
+
+            offTankAI = GET_PLAYERBOT_AI(offTank);
+            if (!offTankAI || offTankAI->GetMaster() != owner)
+            {
+                SendSystemMessage(owner, "pull cancelled because the off-tank bot is no longer under your control.");
+                RestoreBotStates(session);
+                return false;
+            }
+        }
+
         Unit* target = tankAI->GetUnit(session.targetGuid);
         if (session.stage != PullStage::WaitForCombatEnd && !IsValidPullTarget(owner, target))
         {
@@ -2127,6 +2926,25 @@ private:
                 ManageSupportCrowdControl(session, owner, false);
                 SetTankTargetContext(tank, target);
                 return ProcessShotStage(session, owner, tank, tankAI, target);
+            case PullStage::WaitForPullShotResolve:
+                HoldSupportBots(session, owner, tank);
+                ManageSupportCrowdControl(session, owner, false);
+                SetTankTargetContext(tank, target);
+                return ProcessShotResolveStage(session, owner, tank, tankAI, target);
+            case PullStage::FireFollowupPulls:
+                HoldSupportBots(session, owner, tank);
+                ManageSupportCrowdControl(session, owner, true);
+                SetTankTargetContext(tank, target);
+                return ProcessFollowupStage(session, owner, tank, tankAI, target);
+            case PullStage::WaitForFollowupResolve:
+                HoldSupportBots(session, owner, tank);
+                ManageSupportCrowdControl(session, owner, true);
+                SetTankTargetContext(tank, target);
+                return ProcessFollowupResolveStage(session, owner, tank, tankAI, target);
+            case PullStage::ReturnTankToHoldPoint:
+                HoldSupportBots(session, owner, tank);
+                ManageSupportCrowdControl(session, owner, session.pullShotAtMs != 0);
+                return ProcessReturnToTankHoldStage(session, owner, tank, tankAI, target);
             case PullStage::WaitForMobArrival:
                 HoldSupportBots(session, owner, tank);
                 ManageSupportCrowdControl(session, owner, session.pullShotAtMs != 0);
@@ -2176,56 +2994,43 @@ private:
             return false;
         }
 
-        float const desiredDistance = ResolveDesiredPullDistance(session.opener.minRange, session.opener.maxRange);
-        if (desiredDistance <= 0.0f)
+        bool offTankReady = true;
+        if (HasOffTankAssignment(session))
         {
-            SendSystemMessage(owner, "pull cancelled because the tank has no usable shoot range.");
-            RestoreBotStates(session);
-            return false;
+            Player* offTank = ObjectAccessor::FindPlayer(session.offTankGuid);
+            PlayerbotAI* offTankAI = offTank ? GET_PLAYERBOT_AI(offTank) : nullptr;
+            Unit* offTankTarget = ResolveSessionTarget(offTankAI, session.offTankTargetGuid);
+            if (!IsLiveBot(offTank) || !offTankAI || offTankAI->GetMaster() != owner || !IsValidPullTarget(owner, offTankTarget))
+            {
+                ClearOffTankAssignment(session);
+                SendSystemMessage(owner, "off-tank assignment dropped because the off-tank target is no longer valid.");
+            }
+            else if (HasPullAlreadyCollapsedIntoMelee(offTank, offTankTarget))
+            {
+                session.offTankCombatReleased = true;
+            }
+            else
+            {
+                offTankReady = MoveTankIntoPullPosition(session, offTank, offTankAI, offTankTarget, session.offTankOpener,
+                                                        session.offTankMoveStagePrepared);
+            }
         }
 
-        float const distance = tank->GetDistance(target);
-        float const minimumDistance = std::max(0.0f, session.opener.minRange + 0.1f);
-        bool const withinPullDistance = distance <= session.opener.maxRange && distance >= minimumDistance;
-        if (withinPullDistance && !tank->IsWithinLOSInMap(target))
+        bool const mainTankReady = MoveTankIntoPullPosition(session, tank, tankAI, target, session.opener, session.moveStagePrepared);
+        if (!mainTankReady)
+            return true;
+
+        if (!offTankReady)
+            return true;
+
+        if (!AreSupportCrowdControlsReady(session, owner))
         {
-            PullMovementController movement(tankAI);
-            movement.MoveToRangedLos(target);
+            HoldTankBeforeShot(session, tank, target);
             return true;
         }
 
-        if (IsWithinPullWindow(tank, target, session.opener.minRange, session.opener.maxRange))
-        {
-            if (tank->isMoving())
-                tank->StopMoving();
-
-            if (!IsFacingSpellTarget(tank, target))
-            {
-                FaceBotTowardsTarget(tank, target);
-                return true;
-            }
-
-            if (!AreSupportCrowdControlsReady(session, owner))
-            {
-                HoldTankDuringApproach(session, tank, target, tank->GetPositionX(), tank->GetPositionY(), tank->GetPositionZ());
-                return true;
-            }
-
-            session.stage = PullStage::FirePullShot;
-            return ProcessShotStage(session, owner, tank, tankAI, target);
-        }
-
-        float pullX = 0.0f;
-        float pullY = 0.0f;
-        float pullZ = 0.0f;
-        target->GetNearPoint(tank, pullX, pullY, pullZ, 0.0f, desiredDistance, target->GetAngle(tank));
-        HoldTankDuringApproach(session, tank, target, pullX, pullY, pullZ);
-
-        PullMovementController movement(tankAI);
-        if (!movement.MoveToPoint(target->GetMapId(), pullX, pullY, pullZ))
-            movement.MoveIntoRange(target, desiredDistance);
-
-        return true;
+        session.stage = PullStage::FirePullShot;
+        return ProcessShotStage(session, owner, tank, tankAI, target);
     }
 
     bool ProcessShotStage(PullSession& session, Player* owner, Player* tank, PlayerbotAI* tankAI, Unit* target)
@@ -2315,9 +3120,290 @@ private:
         }
 
         session.pullShotAtMs = getMSTime();
-        ManageSupportCrowdControl(session, owner, true);
         session.waitStagePrepared = false;
-        session.stage = PullStage::WaitForMobArrival;
+        session.returnStagePrepared = false;
+        session.offTankWaitStagePrepared = false;
+        session.offTankReturnStagePrepared = false;
+        session.stage = PullStage::WaitForPullShotResolve;
+        return true;
+    }
+
+    bool ProcessShotResolveStage(PullSession& session, Player* owner, Player* tank, PlayerbotAI* tankAI, Unit* target)
+    {
+        (void)tankAI;
+
+        HoldTankBeforeShot(session, tank, target);
+
+        if (HasOffTankAssignment(session))
+        {
+            Player* offTank = ObjectAccessor::FindPlayer(session.offTankGuid);
+            PlayerbotAI* offTankAI = offTank ? GET_PLAYERBOT_AI(offTank) : nullptr;
+            Unit* offTankTarget = ResolveSessionTarget(offTankAI, session.offTankTargetGuid);
+            if (!IsLiveBot(offTank) || !offTankAI || offTankAI->GetMaster() != owner || !IsValidPullTarget(owner, offTankTarget))
+            {
+                ClearOffTankAssignment(session);
+            }
+            else if (HasTankReachedCombatTrigger(offTank, offTankTarget))
+            {
+                ReleaseTankLaneIntoCombat(session, offTank, offTankAI, offTankTarget);
+                session.offTankCombatReleased = true;
+            }
+            else if (!session.offTankCombatReleased)
+            {
+                MoveTankIntoPullPosition(session, offTank, offTankAI, offTankTarget, session.offTankOpener,
+                                         session.offTankMoveStagePrepared);
+            }
+        }
+
+        if (HasPullAlreadyCollapsedIntoMelee(tank, target))
+        {
+            ReleaseIntoCombat(session, owner, tank, GET_PLAYERBOT_AI(tank), target);
+            return true;
+        }
+
+        uint32 const settleDelay = ResolvePullShotSettleDelay(tank, session.opener);
+        uint32 const elapsedMs = getMSTimeDiff(session.pullShotAtMs, getMSTime());
+
+        if (elapsedMs < settleDelay)
+            return true;
+
+        if (IsPullShotStillResolving(tank))
+            return true;
+
+        if (HasOffTankAssignment(session) || HasPendingSupportCrowdControl(session))
+        {
+            session.stage = PullStage::FireFollowupPulls;
+            return true;
+        }
+
+        session.stage = session.usesTankMarker ? PullStage::ReturnTankToHoldPoint : PullStage::WaitForMobArrival;
+        return true;
+    }
+
+    bool ProcessFollowupStage(PullSession& session, Player* owner, Player* tank, PlayerbotAI* tankAI, Unit* target)
+    {
+        (void)tank;
+        (void)tankAI;
+        (void)target;
+
+        if (!HasOffTankAssignment(session))
+        {
+            session.stage = PullStage::ReturnTankToHoldPoint;
+            return true;
+        }
+
+        Player* offTank = ObjectAccessor::FindPlayer(session.offTankGuid);
+        PlayerbotAI* offTankAI = offTank ? GET_PLAYERBOT_AI(offTank) : nullptr;
+        Unit* offTankTarget = ResolveSessionTarget(offTankAI, session.offTankTargetGuid);
+        if (!IsLiveBot(offTank) || !offTankAI || offTankAI->GetMaster() != owner || !IsValidPullTarget(owner, offTankTarget))
+        {
+            ClearOffTankAssignment(session);
+            session.stage = PullStage::ReturnTankToHoldPoint;
+            return true;
+        }
+
+        if (getMSTimeDiff(session.startedAtMs, getMSTime()) > PULL_ACQUIRE_TIMEOUT_MS)
+        {
+            SendSystemMessage(owner, "off-tank assignment dropped because the off-tank could not reach pull range.");
+            ClearOffTankAssignment(session);
+            session.stage = PullStage::ReturnTankToHoldPoint;
+            return true;
+        }
+
+        if (HasTankReachedCombatTrigger(offTank, offTankTarget))
+        {
+            ReleaseTankLaneIntoCombat(session, offTank, offTankAI, offTankTarget);
+            session.offTankCombatReleased = true;
+            session.stage = PullStage::ReturnTankToHoldPoint;
+            return true;
+        }
+
+        if (IsDruidFeralPullOpener(session.offTankOpener) && !IsDruidInBearPullForm(offTank))
+        {
+            if (TryPrepareDruidTankPullForm(offTank, offTankAI, session.offTankOpener))
+                return true;
+
+            SendSystemMessage(owner, "off-tank assignment dropped because the druid off-tank could not enter bear form.");
+            ClearOffTankAssignment(session);
+            session.stage = PullStage::ReturnTankToHoldPoint;
+            return true;
+        }
+
+        SpellCastResult const castCheck = CheckPullOpenerCast(offTank, session.offTankOpener, offTankTarget);
+        if (castCheck == SPELL_FAILED_OUT_OF_RANGE)
+        {
+            MoveTankIntoPullPosition(session, offTank, offTankAI, offTankTarget, session.offTankOpener,
+                                     session.offTankMoveStagePrepared);
+            return true;
+        }
+
+        if (castCheck == SPELL_FAILED_LINE_OF_SIGHT)
+        {
+            PullMovementController movement(offTankAI);
+            movement.MoveToRangedLos(offTankTarget);
+            return true;
+        }
+
+        if (NeedsFacingAdjustment(castCheck))
+        {
+            if (offTank->isMoving())
+                offTank->StopMoving();
+
+            FaceBotTowardsTarget(offTank, offTankTarget);
+            return true;
+        }
+
+        if (ShouldRetrySpellCastLater(castCheck))
+        {
+            if (castCheck == SPELL_FAILED_MOVING && offTank->isMoving())
+                offTank->StopMoving();
+
+            return true;
+        }
+
+        if (IsPullOpenerShapeshiftFailure(castCheck))
+        {
+            if (TryPrepareDruidTankPullForm(offTank, offTankAI, session.offTankOpener))
+                return true;
+        }
+
+        if (castCheck != SPELL_CAST_OK)
+        {
+            SendSystemMessage(owner,
+                              "off-tank assignment dropped because the off-tank could not fire " + session.offTankOpener.name +
+                                  " (" + EnumUtils::ToTitle(castCheck) + ").");
+            ClearOffTankAssignment(session);
+            session.stage = PullStage::ReturnTankToHoldPoint;
+            return true;
+        }
+
+        SetTankTargetContext(offTank, offTankTarget);
+        if (!offTankAI->CastSpell(session.offTankOpener.spellIds.front(), offTankTarget))
+            return true;
+
+        session.offTankPullShotAtMs = getMSTime();
+        session.stage = PullStage::WaitForFollowupResolve;
+        return true;
+    }
+
+    bool ProcessFollowupResolveStage(PullSession& session, Player* owner, Player* tank, PlayerbotAI* tankAI, Unit* target)
+    {
+        (void)owner;
+        (void)tank;
+        (void)tankAI;
+        (void)target;
+
+        if (!HasOffTankAssignment(session) || !session.offTankPullShotAtMs)
+        {
+            session.stage = PullStage::ReturnTankToHoldPoint;
+            return true;
+        }
+
+        Player* offTank = ObjectAccessor::FindPlayer(session.offTankGuid);
+        PlayerbotAI* offTankAI = offTank ? GET_PLAYERBOT_AI(offTank) : nullptr;
+        Unit* offTankTarget = ResolveSessionTarget(offTankAI, session.offTankTargetGuid);
+        if (!IsLiveBot(offTank) || !offTankAI || !offTankTarget)
+        {
+            ClearOffTankAssignment(session);
+            session.stage = PullStage::ReturnTankToHoldPoint;
+            return true;
+        }
+
+        HoldTankBeforeShot(session, offTank, offTankTarget);
+
+        uint32 const settleDelay = ResolvePullShotSettleDelay(offTank, session.offTankOpener);
+        uint32 const elapsedMs = getMSTimeDiff(session.offTankPullShotAtMs, getMSTime());
+        if (elapsedMs < settleDelay)
+            return true;
+
+        if (IsPullShotStillResolving(offTank))
+            return true;
+
+        session.stage = PullStage::ReturnTankToHoldPoint;
+        return true;
+    }
+
+    bool ProcessReturnToTankHoldStage(PullSession& session, Player* owner, Player* tank, PlayerbotAI* tankAI, Unit* target)
+    {
+        bool mainReady = !session.usesTankMarker || !IsStoredPointValidForUnit(session.tankMarkerPosition, tank);
+        if (!mainReady)
+        {
+            if (!session.returnStagePrepared)
+            {
+                PrepareTankForApproach(session, tank, target);
+                session.returnStagePrepared = true;
+            }
+
+            if (HasReachedStoredWorldPoint(tank, session.tankMarkerPosition, TANK_MARKER_REACH_DISTANCE))
+            {
+                if (tank->isMoving())
+                    tank->StopMoving();
+
+                mainReady = true;
+            }
+            else
+            {
+                HoldTankDuringApproach(session, tank, target, session.tankMarkerPosition.x, session.tankMarkerPosition.y,
+                                       session.tankMarkerPosition.z);
+                PullMovementController movement(tankAI);
+                if (!tank->isMoving())
+                {
+                    movement.MoveToPoint(session.tankMarkerPosition.mapId, session.tankMarkerPosition.x, session.tankMarkerPosition.y,
+                                         session.tankMarkerPosition.z);
+                }
+            }
+        }
+
+        bool offTankReady = true;
+        if (HasOffTankAssignment(session))
+        {
+            Player* offTank = ObjectAccessor::FindPlayer(session.offTankGuid);
+            PlayerbotAI* offTankAI = offTank ? GET_PLAYERBOT_AI(offTank) : nullptr;
+            Unit* offTankTarget = ResolveSessionTarget(offTankAI, session.offTankTargetGuid);
+            if (!IsLiveBot(offTank) || !offTankAI || !IsValidPullTarget(owner, offTankTarget))
+            {
+                ClearOffTankAssignment(session);
+            }
+            else if (!session.usesOffTankMarker || !IsStoredPointValidForUnit(session.offTankMarkerPosition, offTank))
+            {
+                offTankReady = true;
+            }
+            else
+            {
+                offTankReady = false;
+                if (!session.offTankReturnStagePrepared)
+                {
+                    PrepareTankForApproach(session, offTank, offTankTarget);
+                    session.offTankReturnStagePrepared = true;
+                }
+
+                if (HasReachedStoredWorldPoint(offTank, session.offTankMarkerPosition, TANK_MARKER_REACH_DISTANCE))
+                {
+                    if (offTank->isMoving())
+                        offTank->StopMoving();
+
+                    offTankReady = true;
+                }
+                else
+                {
+                    HoldTankDuringApproach(session, offTank, offTankTarget, session.offTankMarkerPosition.x,
+                                           session.offTankMarkerPosition.y, session.offTankMarkerPosition.z);
+                    PullMovementController movement(offTankAI);
+                    if (!offTank->isMoving())
+                    {
+                        movement.MoveToPoint(session.offTankMarkerPosition.mapId, session.offTankMarkerPosition.x,
+                                             session.offTankMarkerPosition.y, session.offTankMarkerPosition.z);
+                    }
+                }
+            }
+        }
+
+        if (mainReady && offTankReady)
+        {
+            session.stage = PullStage::WaitForMobArrival;
+            return ProcessWaitStage(session, owner, tank, tankAI, target);
+        }
+
         return true;
     }
 
@@ -2325,12 +3411,44 @@ private:
     {
         SetTankTargetContext(tank, target);
 
-        HoldTankDuringWait(session, tank, target);
-        session.waitStagePrepared = true;
+        if (!session.mainTankCombatReleased)
+        {
+            HoldTankDuringWait(session, tank, target);
+            session.waitStagePrepared = true;
 
-        if (tank->IsWithinMeleeRange(target) ||
-            target->IsWithinMeleeRange(tank) ||
-            (target->GetVictim() == tank && tank->IsWithinCombatRange(target, tank->GetCombatReach() + target->GetCombatReach() + 1.0f)))
+            if (HasTankReachedCombatTrigger(tank, target))
+            {
+                if (IsAutoMarkEnabled(owner))
+                    MarkTargetWithSkull(tank, target);
+
+                ReleaseTankLaneIntoCombat(session, tank, tankAI, target);
+                session.mainTankCombatReleased = true;
+            }
+        }
+
+        if (HasOffTankAssignment(session) && !session.offTankCombatReleased)
+        {
+            Player* offTank = ObjectAccessor::FindPlayer(session.offTankGuid);
+            PlayerbotAI* offTankAI = offTank ? GET_PLAYERBOT_AI(offTank) : nullptr;
+            Unit* offTankTarget = ResolveSessionTarget(offTankAI, session.offTankTargetGuid);
+            if (!IsLiveBot(offTank) || !offTankAI || !IsValidPullTarget(owner, offTankTarget))
+            {
+                ClearOffTankAssignment(session);
+            }
+            else
+            {
+                HoldTankDuringWait(session, offTank, offTankTarget);
+                session.offTankWaitStagePrepared = true;
+
+                if (HasTankReachedCombatTrigger(offTank, offTankTarget))
+                {
+                    ReleaseTankLaneIntoCombat(session, offTank, offTankAI, offTankTarget);
+                    session.offTankCombatReleased = true;
+                }
+            }
+        }
+
+        if (session.mainTankCombatReleased && (!HasOffTankAssignment(session) || session.offTankCombatReleased))
         {
             ReleaseIntoCombat(session, owner, tank, tankAI, target);
             return true;
@@ -2338,7 +3456,11 @@ private:
 
         if (getMSTimeDiff(session.startedAtMs, getMSTime()) > PULL_WAIT_TIMEOUT_MS)
         {
-            if (tank->IsInCombat() || target->IsInCombat())
+            Player* offTank = ObjectAccessor::FindPlayer(session.offTankGuid);
+            PlayerbotAI* offTankAI = offTank ? GET_PLAYERBOT_AI(offTank) : nullptr;
+            Unit* offTankTarget = ResolveSessionTarget(offTankAI, session.offTankTargetGuid);
+            if (tank->IsInCombat() || target->IsInCombat() || (offTank && offTank->IsInCombat()) ||
+                (offTankTarget && offTankTarget->IsInCombat()))
             {
                 SendSystemMessage(owner, "pull wait timed out; releasing the group back into combat.");
                 ReleaseIntoCombat(session, owner, tank, tankAI, target);
@@ -2394,6 +3516,12 @@ private:
             botAI->DoNextAction();
         }
 
+        if (session.usesTankMarker)
+            tankMarkers.erase(owner->GetGUID());
+
+        if (session.usesOffTankMarker)
+            offTankMarkers.erase(owner->GetGUID());
+
         return false;
     }
 
@@ -2436,6 +3564,24 @@ private:
             tank->StopMoving();
     }
 
+    void HoldTankBeforeShot(PullSession& session, Player* tank, Unit* target)
+    {
+        BotHoldState* state = FindBotState(session, tank->GetGUID());
+        if (!state)
+            return;
+
+        PlayerbotAI* tankAI = GET_PLAYERBOT_AI(tank);
+        if (!tankAI)
+            return;
+
+        EnsureStrategy(tankAI, state->addedCombatStay, BOT_STATE_COMBAT, "stay");
+        SetHoldPosition(*state, tankAI, tank->GetPositionX(), tank->GetPositionY(), tank->GetPositionZ());
+        SetTankTargetContext(tank, target);
+
+        if (tank->isMoving())
+            tank->StopMoving();
+    }
+
     void PrepareTankForApproach(PullSession& session, Player* tank, Unit* target)
     {
         BotHoldState* state = FindBotState(session, tank->GetGUID());
@@ -2447,7 +3593,7 @@ private:
             return;
 
         SetTankTargetContext(tank, target);
-        StopBotCombat(tank, true);
+        ClearBotCombatStateForRetreat(tank);
         tankAI->GetAiObjectContext()->GetValue<Unit*>("old target")->Set(nullptr);
         tankAI->GetAiObjectContext()->GetValue<Unit*>("current target")->Set(nullptr);
         tankAI->GetAiObjectContext()->GetValue<GuidVector>("prioritized targets")->Reset();
@@ -2471,9 +3617,34 @@ private:
         SetTankTargetContext(tank, target);
     }
 
+    void ReleaseTankLaneIntoCombat(PullSession& session, Player* tank, PlayerbotAI* tankAI, Unit* target)
+    {
+        if (!IsLiveBot(tank) || !tankAI || !target)
+            return;
+
+        if (BotHoldState* state = FindBotState(session, tank->GetGUID()))
+        {
+            RemoveStrategy(tankAI, state->addedCombatStay, BOT_STATE_COMBAT, "stay");
+            RemoveStrategy(tankAI, state->addedCombatPassive, BOT_STATE_COMBAT, "passive");
+            state->addedCombatStay = false;
+            state->addedCombatPassive = false;
+        }
+
+        if (tank->isMoving())
+            tank->StopMoving();
+
+        SetTankTargetContext(tank, target);
+        ResetBotMovementState(tankAI);
+        tankAI->ChangeEngine(BOT_STATE_COMBAT);
+        tankAI->DoSpecificAction("attack", Event(), true);
+    }
+
     void ReleaseIntoCombat(PullSession& session, Player* owner, Player* tank, PlayerbotAI* tankAI, Unit* target)
     {
         session.stage = PullStage::WaitForCombatEnd;
+        Player* offTank = ObjectAccessor::FindPlayer(session.offTankGuid);
+        PlayerbotAI* offTankAI = offTank ? GET_PLAYERBOT_AI(offTank) : nullptr;
+        Unit* offTankTarget = ResolveSessionTarget(offTankAI, session.offTankTargetGuid);
         RestoreBotStates(session);
 
         if (target && target->IsInWorld() && !target->isDead())
@@ -2481,9 +3652,19 @@ private:
             if (IsAutoMarkEnabled(owner))
                 MarkTargetWithSkull(tank, target);
 
-            SetTankTargetContext(tank, target);
-            tankAI->ChangeEngine(BOT_STATE_COMBAT);
-            tankAI->DoSpecificAction("attack", Event(), true);
+            ReleaseTankLaneIntoCombat(session, tank, tankAI, target);
+            session.mainTankCombatReleased = true;
+
+            if (IsValidPullTarget(owner, offTankTarget) && IsLiveBot(offTank) && offTankAI)
+            {
+                ReleaseTankLaneIntoCombat(session, offTank, offTankAI, offTankTarget);
+                session.offTankCombatReleased = true;
+            }
+            else if (IsLiveBot(offTank) && offTankAI && offTank != tank)
+            {
+                ReleaseTankLaneIntoCombat(session, offTank, offTankAI, target);
+                session.offTankCombatReleased = true;
+            }
 
             for (BotHoldState const& state : session.botStates)
             {
@@ -2536,7 +3717,7 @@ private:
             if (state.hadNonCombatFollow && !botAI->HasStrategy("follow", BOT_STATE_NON_COMBAT))
                 botAI->ChangeStrategy("+follow", BOT_STATE_NON_COMBAT);
 
-            if (state.isTank && session.addedTankPullStrategy)
+            if (state.guid == session.tankGuid && session.addedTankPullStrategy)
                 botAI->ChangeStrategy("-pull", BOT_STATE_COMBAT);
 
             if (bot->isMoving())
@@ -2566,6 +3747,8 @@ private:
     }
 
     std::map<ObjectGuid, PullSession> sessions;
+    std::map<ObjectGuid, TankMarkerState> tankMarkers;
+    std::map<ObjectGuid, TankMarkerState> offTankMarkers;
     std::set<ObjectGuid> disabledAutoMarkOwners;
     uint32 updateAccumulator = 0;
 };
@@ -3171,7 +4354,8 @@ public:
                          PLAYERHOOK_CAN_PLAYER_USE_PRIVATE_CHAT,
                          PLAYERHOOK_CAN_PLAYER_USE_GROUP_CHAT,
                          PLAYERHOOK_CAN_PLAYER_USE_GUILD_CHAT,
-                         PLAYERHOOK_CAN_PLAYER_USE_CHANNEL_CHAT })
+                         PLAYERHOOK_CAN_PLAYER_USE_CHANNEL_CHAT,
+                         PLAYERHOOK_ON_SPELL_CAST })
     {
     }
 
@@ -3200,10 +4384,17 @@ public:
         return !TryHandleCombatCommand(player, msg);
     }
 
+    void OnPlayerSpellCast(Player* player, Spell* spell, bool /*skipCheck*/) override
+    {
+        PullManager::Instance().HandlePlayerSpellCast(player, spell);
+    }
+
 private:
     bool TryHandleCombatCommand(Player* player, std::string const& msg)
     {
         return PullManager::Instance().TryHandleAutoMarkCommand(player, msg) ||
+               PullManager::Instance().TryHandleTankCommand(player, msg) ||
+               PullManager::Instance().TryHandleOffTankCommand(player, msg) ||
                PullManager::Instance().TryHandleCommand(player, msg) ||
                SapManager::Instance().TryHandleCommand(player, msg);
     }
